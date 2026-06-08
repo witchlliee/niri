@@ -64,14 +64,14 @@ use smithay::wayland::xdg_activation::{
 };
 use smithay::{
     delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_dmabuf,
-    delegate_drm_lease, delegate_drm_syncobj, delegate_ext_data_control, delegate_fractional_scale,
-    delegate_idle_inhibit, delegate_idle_notify, delegate_input_method_manager,
-    delegate_keyboard_shortcuts_inhibit, delegate_output, delegate_pointer_constraints,
-    delegate_pointer_gestures, delegate_presentation, delegate_primary_selection,
-    delegate_relative_pointer, delegate_seat, delegate_security_context, delegate_session_lock,
-    delegate_single_pixel_buffer, delegate_tablet_manager, delegate_tearing_control,
-    delegate_text_input_manager, delegate_viewporter, delegate_virtual_keyboard_manager,
-    delegate_xdg_activation,
+    delegate_drm_lease, delegate_drm_syncobj, delegate_ext_data_control, delegate_fifo,
+    delegate_fractional_scale, delegate_idle_inhibit, delegate_idle_notify,
+    delegate_input_method_manager, delegate_keyboard_shortcuts_inhibit, delegate_output,
+    delegate_pointer_constraints, delegate_pointer_gestures, delegate_presentation,
+    delegate_primary_selection, delegate_relative_pointer, delegate_seat,
+    delegate_security_context, delegate_session_lock, delegate_single_pixel_buffer,
+    delegate_tablet_manager, delegate_tearing_control, delegate_text_input_manager,
+    delegate_viewporter, delegate_virtual_keyboard_manager, delegate_xdg_activation,
 };
 
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
@@ -439,6 +439,8 @@ delegate_output!(State);
 delegate_presentation!(State);
 
 delegate_tearing_control!(State);
+
+delegate_fifo!(State);
 
 impl DmabufHandler for State {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
