@@ -147,9 +147,11 @@ use crate::layout::{
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
-use crate::protocols::color_management::{
-    surface_image_description, ColorManagementState, ImageDescription,
+use smithay::wayland::color::management::{
+    get_surface_description, ColorManagementState, Feature, ImageDescription,
+    Primaries as CmPrimaries, RenderIntent, TransferFunction as CmTransferFunction,
 };
+
 use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
@@ -2247,7 +2249,8 @@ impl Niri {
         if !window.sizing_mode().is_fullscreen() {
             return None;
         }
-        let desc = surface_image_description(window.toplevel().wl_surface())?;
+        let (desc, _intent) = get_surface_description(window.toplevel().wl_surface());
+        let desc = desc?;
         desc.is_hdr().then_some(desc)
     }
 
@@ -2383,12 +2386,24 @@ impl Niri {
         // before. Actual HDR signalling is additionally restricted to the TTY backend (it lives in
         // `Tty::render`), so advertising on winit/headless is harmless. (Snapshot taken at startup;
         // toggling `hdr` in the config needs a restart to (un)advertise the global.)
-        let advertise_color_management =
-            config.borrow().outputs.0.iter().any(|o| o.hdr.is_some());
-        let color_management_state =
-            ColorManagementState::new::<State, _>(&display_handle, move |_client| {
-                advertise_color_management
-            });
+        let advertise_color_management = config.borrow().outputs.0.iter().any(|o| o.hdr.is_some());
+        let color_management_state = ColorManagementState::new::<State, _>(
+            &display_handle,
+            [
+                CmTransferFunction::Srgb,
+                CmTransferFunction::Gamma22,
+                CmTransferFunction::St2084Pq,
+            ],
+            [CmPrimaries::Srgb, CmPrimaries::Bt2020],
+            // Mastering-metadata features so HDR clients can convey it without erroring.
+            [
+                Feature::Parametric,
+                Feature::SetMasteringDisplayPrimaries,
+                Feature::SetLuminances,
+            ],
+            [RenderIntent::Perceptual],
+            move |_client| advertise_color_management,
+        );
         let activation_state = XdgActivationState::new::<State>(&display_handle);
         event_loop
             .insert_source(
