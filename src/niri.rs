@@ -58,6 +58,7 @@ use smithay::reexports::calloop::{
     Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken,
 };
 use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1;
+use smithay::reexports::wayland_protocols::wp::tearing_control::v1::server::wp_tearing_control_v1::PresentationHint;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities;
 use smithay::reexports::wayland_protocols_misc::server_decoration as _server_decoration;
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
@@ -78,6 +79,8 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::DmabufState;
+use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
+use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
@@ -105,6 +108,7 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::tablet_manager::TabletManagerState;
+use smithay::wayland::tearing_control::{TearingControlState, TearingControlSurfaceCachedState};
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
@@ -293,6 +297,7 @@ pub struct Niri {
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub dmabuf_state: DmabufState,
+    pub syncobj_state: Option<DrmSyncobjState>,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub seat_state: SeatState<State>,
     pub tablet_state: TabletManagerState,
@@ -313,11 +318,13 @@ pub struct Niri {
     pub popups: PopupManager,
     pub popup_grab: Option<PopupGrabState>,
     pub presentation_state: PresentationState,
+    pub tearing_control_state: TearingControlState,
     pub security_context_state: SecurityContextState,
     pub gamma_control_manager_state: GammaControlManagerState,
     pub color_management_state: ColorManagementState,
     pub activation_state: XdgActivationState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
+    pub fifo_manager_state: FifoManagerState,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -773,7 +780,16 @@ impl State {
         // build up (the 1 second frame callback timer will call this line).
         self.niri.advance_animations();
 
-        self.niri.redraw_queued_outputs(&mut self.backend);
+        for output in self.niri.queued_outputs() {
+            if self.niri.is_queued(&output) {
+                self.niri.redraw(&mut self.backend, &output);
+
+                let state = self.niri.output_state.get(&output).unwrap();
+                if matches!(state.redraw_state, RedrawState::Idle) {
+                    self.signal_fifo(&output);
+                }
+            }
+        }
 
         {
             let _span = tracy_client::span!("flush_clients");
@@ -853,6 +869,53 @@ impl State {
             trace!("calling blocker_cleared");
             self.client_compositor_state(&client)
                 .blocker_cleared(self, &dh);
+        }
+    }
+
+    pub fn signal_fifo(&mut self, output: &Output) {
+        #[allow(clippy::mutable_key_type)]
+        let mut clients = HashMap::new();
+
+        self.niri
+            .for_each_output_surface(output, |surface, states| {
+                let primary_scanout_output = surface_primary_scanout_output(surface, states);
+                if primary_scanout_output.as_ref().is_some_and(|o| o != output) {
+                    return;
+                }
+
+                Self::signal_fifo_surface(surface, states, &mut clients);
+            });
+
+        for unmapped in self.niri.unmapped_windows.values() {
+            unmapped.window.with_surfaces(|surface, states| {
+                Self::signal_fifo_surface(surface, states, &mut clients);
+            });
+        }
+
+        let display_handle = self.niri.display_handle.clone();
+        for client in clients.into_values() {
+            self.client_compositor_state(&client)
+                .blocker_cleared(self, &display_handle);
+        }
+    }
+
+    fn signal_fifo_surface(
+        surface: &WlSurface,
+        states: &SurfaceData,
+        clients: &mut HashMap<ClientId, Client>,
+    ) {
+        let fifo_barrier = states
+            .cached_state
+            .get::<FifoBarrierCachedState>()
+            .current()
+            .barrier
+            .take();
+
+        if let Some(fifo_barrier) = fifo_barrier {
+            fifo_barrier.signal();
+            if let Some(client) = surface.client() {
+                clients.insert(client.id(), client);
+            }
         }
     }
 
@@ -2516,6 +2579,7 @@ impl Niri {
         );
         let presentation_state =
             PresentationState::new::<State>(&display_handle, Monotonic::ID as u32);
+        let tearing_control_state = TearingControlState::new::<State>(&display_handle);
         let security_context_state =
             SecurityContextState::new::<State, _>(&display_handle, client_is_unrestricted);
 
@@ -2584,6 +2648,7 @@ impl Niri {
 
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
+        let fifo_manager_state = FifoManagerState::new::<State>(&display_handle);
 
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);
@@ -2756,6 +2821,7 @@ impl Niri {
             shm_state,
             output_manager_state,
             dmabuf_state,
+            syncobj_state: None,
             fractional_scale_manager_state,
             seat_state,
             tablet_state,
@@ -2775,11 +2841,13 @@ impl Niri {
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             presentation_state,
+            tearing_control_state,
             security_context_state,
             gamma_control_manager_state,
             color_management_state,
             activation_state,
             mutter_x11_interop_state,
+            fifo_manager_state,
             #[cfg(test)]
             single_pixel_buffer_state,
 
@@ -3867,6 +3935,40 @@ impl Niri {
         self.layout.outputs().find(has_layer_surface)
     }
 
+    pub fn for_each_output_surface(
+        &self,
+        output: &Output,
+        mut f: impl FnMut(&WlSurface, &SurfaceData),
+    ) {
+        let Some(output_state) = self.output_state.get(output) else {
+            return;
+        };
+
+        for mapped in self.layout.windows_for_output(output) {
+            mapped
+                .window
+                .with_surfaces(|surface, states| f(surface, states));
+        }
+
+        for surface in layer_map_for_output(output).layers() {
+            surface.with_surfaces(|surface, states| f(surface, states));
+        }
+
+        if let Some(surface) = &output_state.lock_surface {
+            with_surfaces_surface_tree(surface.wl_surface(), |surface, states| {
+                f(surface, states);
+            });
+        }
+
+        if let Some(surface) = self.dnd_icon.as_ref().map(|icon| &icon.surface) {
+            with_surfaces_surface_tree(surface, |surface, states| f(surface, states));
+        }
+
+        if let CursorImageStatus::Surface(surface) = self.cursor_manager.cursor_image() {
+            with_surfaces_surface_tree(surface, |surface, states| f(surface, states));
+        }
+    }
+
     pub fn lock_surface_focus(&self) -> Option<WlSurface> {
         let output_under_cursor = self.output_under_cursor();
         let output = output_under_cursor
@@ -3891,19 +3993,16 @@ impl Niri {
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
     }
 
-    pub fn redraw_queued_outputs(&mut self, backend: &mut Backend) {
-        let _span = tracy_client::span!("Niri::redraw_queued_outputs");
+    pub fn queued_outputs(&self) -> Vec<Output> {
+        self.output_state.keys().cloned().collect()
+    }
 
-        while let Some((output, _)) = self.output_state.iter().find(|(_, state)| {
-            matches!(
-                state.redraw_state,
-                RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
-            )
-        }) {
-            trace!("redrawing output");
-            let output = output.clone();
-            self.redraw(backend, &output);
-        }
+    pub fn is_queued(&self, output: &Output) -> bool {
+        let state = self.output_state.get(output).unwrap();
+        matches!(
+            state.redraw_state,
+            RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+        )
     }
 
     pub fn render_pointer<R: NiriRenderer>(
@@ -4958,6 +5057,31 @@ impl Niri {
         backend.set_output_on_demand_vrr(self, output, current);
     }
 
+    pub fn output_allows_tearing(&self, output: &Output) -> bool {
+        self.layout.windows_for_output(output).any(|mapped| {
+            let mut visible = false;
+            let mut hint = false;
+
+            mapped.window.with_surfaces(|surface, states| {
+                if surface_primary_scanout_output(surface, states).as_ref() != Some(output) {
+                    return;
+                }
+
+                visible = true;
+                let mut state = states
+                    .cached_state
+                    .get::<TearingControlSurfaceCachedState>();
+                hint |= *state.current().presentation_hint() == PresentationHint::Async;
+            });
+
+            match mapped.rules().allow_tearing {
+                Some(true) => visible,
+                Some(false) => false,
+                None => hint,
+            }
+        })
+    }
+
     pub fn update_primary_scanout_output(
         &self,
         output: &Output,
@@ -5145,6 +5269,45 @@ impl Niri {
         }
     }
 
+    pub fn add_syncobj_state(&mut self, device_fd: smithay::backend::drm::DrmDeviceFd) {
+        let disable_syncobj = env::var_os("NIRI_DISABLE_SYNCOBJ").is_some();
+        if !supports_syncobj_eventfd(&device_fd) || disable_syncobj {
+            self.remove_syncobj_state();
+            return;
+        }
+
+        if let Some(state) = self.syncobj_state.as_mut() {
+            state.update_device(device_fd);
+        } else {
+            self.syncobj_state = Some(DrmSyncobjState::new::<State>(
+                &self.display_handle,
+                device_fd,
+            ))
+        }
+        debug!("explicit sync enabled for primary gpu")
+    }
+
+    pub fn remove_syncobj_state(&mut self) {
+        let Some(state) = self.syncobj_state.take() else {
+            return;
+        };
+
+        let global = state.into_global();
+        self.display_handle.disable_global::<State>(global.clone());
+        self.event_loop
+            .insert_source(
+                Timer::from_duration(Duration::from_secs(10)),
+                move |_, _, state| {
+                    state
+                        .niri
+                        .display_handle
+                        .remove_global::<State>(global.clone());
+                    TimeoutAction::Drop
+                },
+            )
+            .unwrap();
+    }
+
     pub fn send_dmabuf_feedbacks(
         &self,
         output: &Output,
@@ -5166,6 +5329,7 @@ impl Niri {
                         render_element_states,
                         &feedback.render,
                         &feedback.scanout,
+                        &feedback.r#async,
                     )
                 },
             );
@@ -5181,6 +5345,7 @@ impl Niri {
                         render_element_states,
                         &feedback.render,
                         &feedback.scanout,
+                        &feedback.r#async,
                     )
                 },
             );
@@ -5197,6 +5362,7 @@ impl Niri {
                         render_element_states,
                         &feedback.render,
                         &feedback.scanout,
+                        &feedback.r#async,
                     )
                 },
             );
@@ -5213,6 +5379,7 @@ impl Niri {
                         render_element_states,
                         &feedback.render,
                         &feedback.scanout,
+                        &feedback.r#async,
                     )
                 },
             );
@@ -5229,6 +5396,7 @@ impl Niri {
                         render_element_states,
                         &feedback.render,
                         &feedback.scanout,
+                        &feedback.r#async,
                     )
                 },
             );
