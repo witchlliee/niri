@@ -2222,14 +2222,14 @@ impl Tty {
                 }
             }
 
-            flags
+            (flags, presentation_mode)
         };
 
         // Hand them over to the DRM.
         set_frame_blend(renderer.as_gles_renderer(), blend);
         let drm_compositor = &mut surface.compositor;
         let render_frame_result =
-            drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags);
+            drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags, presentation_mode);
         set_frame_blend(renderer.as_gles_renderer(), None);
         match render_frame_result {
             Ok(res) => {
